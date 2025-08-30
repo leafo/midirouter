@@ -1,4 +1,4 @@
-module midirouter
+module github.com/leafo/midirouter
 
 go 1.24.2
 
