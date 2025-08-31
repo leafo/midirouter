@@ -308,8 +308,21 @@ func interactiveConfig(drv *rtmididrv.Driver) (*Config, error) {
 	// Configure each output
 	config.Outputs = make([]OutputConfig, numOutputs)
 	for i := 0; i < numOutputs; i++ {
-		fmt.Printf("Output %d: %s Out %d\n", i+1, outputBase, i+1)
-		config.Outputs[i].Name = fmt.Sprintf("%s Out %d", outputBase, i+1)
+		defaultOutputName := fmt.Sprintf("Out %d", i+1)
+		fmt.Printf("Configuring output %d...\n", i+1)
+
+		fmt.Printf("Enter output name: (default: '%s'): ", defaultOutputName)
+		line, err = reader.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("failed to read input: %w", err)
+		}
+
+		outputName := strings.TrimSpace(line)
+		if outputName == "" {
+			outputName = defaultOutputName
+		}
+
+		config.Outputs[i].Name = outputName
 
 		// Channel filter
 		fmt.Print("Enable channel filter? (y/N): ")
@@ -491,7 +504,8 @@ func runMIDIRouter(drv *rtmididrv.Driver, config *Config, quiet bool) error {
 	senders := make([]func(midi.Message) error, len(config.Outputs))
 
 	for i, outputConfig := range config.Outputs {
-		virtualOut, err := drv.OpenVirtualOut(outputConfig.Name)
+		fullName := fmt.Sprintf("%s %s", config.OutputBase, outputConfig.Name)
+		virtualOut, err := drv.OpenVirtualOut(fullName)
 		if err != nil {
 			return fmt.Errorf("failed to create virtual output %d: %w", i+1, err)
 		}
@@ -519,11 +533,12 @@ func runMIDIRouter(drv *rtmididrv.Driver, config *Config, quiet bool) error {
 
 		for i, outputConfig := range config.Outputs {
 			if shouldRouteMessage(msg, &outputConfig) {
+				fullName := fmt.Sprintf("%s %s", config.OutputBase, outputConfig.Name)
 				err := senders[i](msg)
 				if err != nil {
-					log.Printf("Error sending to %s: %v", outputConfig.Name, err)
+					log.Printf("Error sending to %s: %v", fullName, err)
 				} else {
-					routedTo = append(routedTo, outputConfig.Name)
+					routedTo = append(routedTo, fullName)
 				}
 			}
 		}
