@@ -24,10 +24,34 @@ type ChannelFilter struct {
 	Channel uint8 `json:"channel"` // 1-16
 }
 
+// ShouldPass tests if a MIDI message should pass through this channel filter
+func (cf *ChannelFilter) ShouldPass(msg midi.Message) bool {
+	var channel, key, velocity uint8
+	if msg.GetNoteOn(&channel, &key, &velocity) || msg.GetNoteOff(&channel, &key, &velocity) {
+		return channel+1 == cf.Channel
+	}
+	// For other message types, try to get channel
+	if len(msg) >= 1 {
+		msgChannel := (msg[0] & 0x0F) + 1
+		return msgChannel == cf.Channel
+	}
+	return true
+}
+
 // NoteRangeFilter represents a note range filter
 type NoteRangeFilter struct {
 	MinNote uint8 `json:"min_note"` // MIDI note number 0-127
 	MaxNote uint8 `json:"max_note"` // MIDI note number 0-127
+}
+
+// ShouldPass tests if a MIDI message should pass through this note range filter
+func (nrf *NoteRangeFilter) ShouldPass(msg midi.Message) bool {
+	var channel, key, velocity uint8
+	if msg.GetNoteOn(&channel, &key, &velocity) || msg.GetNoteOff(&channel, &key, &velocity) {
+		return key >= nrf.MinNote && key <= nrf.MaxNote
+	}
+	// Non-note messages pass through
+	return true
 }
 
 // OutputConfig represents the configuration for a single output
@@ -449,29 +473,15 @@ func captureNote(inputPort drivers.In) (uint8, error) {
 func shouldRouteMessage(msg midi.Message, outputConfig *OutputConfig) bool {
 	// Channel filter
 	if outputConfig.ChannelFilter != nil {
-		var channel, key, velocity uint8
-		if msg.GetNoteOn(&channel, &key, &velocity) || msg.GetNoteOff(&channel, &key, &velocity) {
-			if channel+1 != outputConfig.ChannelFilter.Channel {
-				return false
-			}
-		} else {
-			// For other message types, try to get channel
-			if len(msg) >= 1 {
-				msgChannel := (msg[0] & 0x0F) + 1
-				if msgChannel != outputConfig.ChannelFilter.Channel {
-					return false
-				}
-			}
+		if !outputConfig.ChannelFilter.ShouldPass(msg) {
+			return false
 		}
 	}
 
 	// Note range filter
 	if outputConfig.NoteRangeFilter != nil {
-		var channel, key, velocity uint8
-		if msg.GetNoteOn(&channel, &key, &velocity) || msg.GetNoteOff(&channel, &key, &velocity) {
-			if key < outputConfig.NoteRangeFilter.MinNote || key > outputConfig.NoteRangeFilter.MaxNote {
-				return false
-			}
+		if !outputConfig.NoteRangeFilter.ShouldPass(msg) {
+			return false
 		}
 	}
 
