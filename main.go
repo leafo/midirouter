@@ -64,19 +64,14 @@ func main() {
 	// Check execution mode
 	if *configFile != "" {
 		// Config file mode: load existing config and run router
-		fmt.Println("MIDI Router - Loading Configuration")
-		fmt.Println("==================================")
 
-		config, err = loadAndValidateConfig(*configFile, drv)
+		config, err = loadConfigWithFallback(*configFile, drv)
 		if err != nil {
 			log.Fatalf("Failed to load config: %v", err)
 		}
 
-		fmt.Printf("Loaded configuration from %s\n", *configFile)
 	} else {
 		// Interactive mode
-		fmt.Println("MIDI Router - Interactive Configuration")
-		fmt.Println("======================================")
 
 		config, err = interactiveConfig(drv)
 		if err != nil {
@@ -89,8 +84,7 @@ func main() {
 			if err != nil {
 				log.Fatalf("Failed to save config: %v", err)
 			}
-			fmt.Printf("\nConfiguration saved to %s\n", *saveConfigFile)
-			fmt.Printf("Router configuration complete. Use './midirouter --config %s' to run with saved config.\n", *saveConfigFile)
+			fmt.Printf("Configuration saved to %s\n", *saveConfigFile)
 			return
 		}
 
@@ -108,11 +102,16 @@ func main() {
 	}
 }
 
-// saveConfig saves the configuration to a JSON file
+// saveConfig saves the configuration to a JSON file or prints to stdout if filename is empty
 func saveConfig(config *Config, filename string) error {
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	if filename == "" {
+		fmt.Print(string(data))
+		return nil
 	}
 
 	err = ioutil.WriteFile(filename, data, 0644)
@@ -120,7 +119,6 @@ func saveConfig(config *Config, filename string) error {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
-	fmt.Printf("Configuration saved to %s\n", filename)
 	return nil
 }
 
@@ -140,6 +138,71 @@ func loadConfig(filename string) (*Config, error) {
 	return &config, nil
 }
 
+// validateConfigStructure validates the configuration structure (outputs, filters, etc.)
+func validateConfigStructure(config *Config) error {
+	if len(config.Outputs) == 0 {
+		return fmt.Errorf("no outputs configured")
+	}
+
+	for i, output := range config.Outputs {
+		if output.Name == "" {
+			return fmt.Errorf("output %d has no name", i+1)
+		}
+		if output.ChannelFilter.Enabled && (output.ChannelFilter.Channel < 1 || output.ChannelFilter.Channel > 16) {
+			return fmt.Errorf("output %d has invalid channel: %d (must be 1-16)", i+1, output.ChannelFilter.Channel)
+		}
+		if output.NoteRangeFilter.Enabled && output.NoteRangeFilter.MinNote > output.NoteRangeFilter.MaxNote {
+			return fmt.Errorf("output %d has invalid note range: %d-%d", i+1, output.NoteRangeFilter.MinNote, output.NoteRangeFilter.MaxNote)
+		}
+	}
+
+	return nil
+}
+
+// validateInputDevice checks if the input device exists in the available devices
+func validateInputDevice(deviceName string, drv *rtmididrv.Driver) error {
+	ins, err := drv.Ins()
+	if err != nil {
+		return fmt.Errorf("failed to get MIDI inputs: %w", err)
+	}
+
+	for _, in := range ins {
+		if in.String() == deviceName {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("configured input device not found: %s\nAvailable devices: %v",
+		deviceName, getDeviceNames(ins))
+}
+
+// loadConfigWithFallback loads config and falls back to interactive input selection if device not found
+func loadConfigWithFallback(filename string, drv *rtmididrv.Driver) (*Config, error) {
+	config, err := loadConfig(filename)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate config structure first
+	if err := validateConfigStructure(config); err != nil {
+		return nil, err
+	}
+
+	// Check if input device exists
+	if err := validateInputDevice(config.InputDevice, drv); err != nil {
+		fmt.Printf("Warning: %s\n", err.Error())
+
+		selectedInput, err := selectInputDevice(drv)
+		if err != nil {
+			return nil, fmt.Errorf("failed to select input device: %w", err)
+		}
+
+		config.InputDevice = selectedInput.String()
+	}
+
+	return config, nil
+}
+
 // loadAndValidateConfig loads configuration from file and validates it
 func loadAndValidateConfig(filename string, drv *rtmididrv.Driver) (*Config, error) {
 	config, err := loadConfig(filename)
@@ -147,40 +210,14 @@ func loadAndValidateConfig(filename string, drv *rtmididrv.Driver) (*Config, err
 		return nil, err
 	}
 
-	// Validate that the configured input device exists
-	ins, err := drv.Ins()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get MIDI inputs: %w", err)
+	// Validate config structure
+	if err := validateConfigStructure(config); err != nil {
+		return nil, err
 	}
 
-	var inputFound bool
-	for _, in := range ins {
-		if in.String() == config.InputDevice {
-			inputFound = true
-			break
-		}
-	}
-
-	if !inputFound {
-		return nil, fmt.Errorf("configured input device not found: %s\nAvailable devices: %v",
-			config.InputDevice, getDeviceNames(ins))
-	}
-
-	// Validate configuration structure
-	if len(config.Outputs) == 0 {
-		return nil, fmt.Errorf("no outputs configured")
-	}
-
-	for i, output := range config.Outputs {
-		if output.Name == "" {
-			return nil, fmt.Errorf("output %d has no name", i+1)
-		}
-		if output.ChannelFilter.Enabled && (output.ChannelFilter.Channel < 1 || output.ChannelFilter.Channel > 16) {
-			return nil, fmt.Errorf("output %d has invalid channel: %d (must be 1-16)", i+1, output.ChannelFilter.Channel)
-		}
-		if output.NoteRangeFilter.Enabled && output.NoteRangeFilter.MinNote > output.NoteRangeFilter.MaxNote {
-			return nil, fmt.Errorf("output %d has invalid note range: %d-%d", i+1, output.NoteRangeFilter.MinNote, output.NoteRangeFilter.MaxNote)
-		}
+	// Validate input device
+	if err := validateInputDevice(config.InputDevice, drv); err != nil {
+		return nil, err
 	}
 
 	return config, nil
@@ -195,12 +232,11 @@ func getDeviceNames(devices []drivers.In) []string {
 	return names
 }
 
-// interactiveConfig guides the user through configuration setup
-func interactiveConfig(drv *rtmididrv.Driver) (*Config, error) {
+// selectInputDevice presents available MIDI input devices and lets user select one
+func selectInputDevice(drv *rtmididrv.Driver) (drivers.In, error) {
 	reader := bufio.NewReader(os.Stdin)
-	config := &Config{}
 
-	// Select input device
+	// Get available input devices
 	ins, err := drv.Ins()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get MIDI inputs: %w", err)
@@ -210,10 +246,9 @@ func interactiveConfig(drv *rtmididrv.Driver) (*Config, error) {
 		return nil, fmt.Errorf("no MIDI input devices found")
 	}
 
-	fmt.Printf("\nStep 1: Select MIDI Input Device\n")
-	fmt.Printf("Available MIDI Input Devices:\n")
+	fmt.Printf("Select MIDI Input Device:\n")
 	for i, in := range ins {
-		fmt.Printf("%d: %s\n", i+1, in.String())
+		fmt.Printf("  %d: %s\n", i+1, in.String())
 	}
 
 	fmt.Print("Select input device (1-", len(ins), "): ")
@@ -228,13 +263,26 @@ func interactiveConfig(drv *rtmididrv.Driver) (*Config, error) {
 	}
 
 	selectedInput := ins[choice-1]
+	return selectedInput, nil
+}
+
+// interactiveConfig guides the user through configuration setup
+func interactiveConfig(drv *rtmididrv.Driver) (*Config, error) {
+	reader := bufio.NewReader(os.Stdin)
+	config := &Config{}
+
+	fmt.Println("Starting interactive configuration...")
+
+	// Select input device
+	selectedInput, err := selectInputDevice(drv)
+	if err != nil {
+		return nil, err
+	}
 	config.InputDevice = selectedInput.String()
-	fmt.Printf("Selected input: %s\n", config.InputDevice)
 
 	// Get output base name
-	fmt.Printf("\nStep 2: Output Configuration\n")
 	fmt.Print("Enter base name for outputs (default: 'MIDI Router'): ")
-	line, err = reader.ReadString('\n')
+	line, err := reader.ReadString('\n')
 	if err != nil {
 		return nil, fmt.Errorf("failed to read input: %w", err)
 	}
@@ -260,8 +308,7 @@ func interactiveConfig(drv *rtmididrv.Driver) (*Config, error) {
 	// Configure each output
 	config.Outputs = make([]OutputConfig, numOutputs)
 	for i := 0; i < numOutputs; i++ {
-		fmt.Printf("\nConfiguring Output %d of %d\n", i+1, numOutputs)
-		fmt.Printf("Name: %s Out %d\n", outputBase, i+1)
+		fmt.Printf("Output %d: %s Out %d\n", i+1, outputBase, i+1)
 		config.Outputs[i].Name = fmt.Sprintf("%s Out %d", outputBase, i+1)
 
 		// Channel filter
@@ -285,7 +332,6 @@ func interactiveConfig(drv *rtmididrv.Driver) (*Config, error) {
 
 			config.Outputs[i].ChannelFilter.Enabled = true
 			config.Outputs[i].ChannelFilter.Channel = uint8(channel)
-			fmt.Printf("Channel filter enabled for channel %d\n", channel)
 		}
 
 		// Note range filter
@@ -317,40 +363,34 @@ func noteToName(note uint8) string {
 
 // configureNoteRange configures note range by listening to actual MIDI input
 func configureNoteRange(inputPort drivers.In) (*NoteRangeFilter, error) {
-	fmt.Println("\nNote Range Configuration")
-	fmt.Println("========================")
-	fmt.Println("Play the LOWEST note you want to include in this output.")
+	fmt.Printf("Play the LOWEST note: ")
 
-	minNote, err := captureNote(inputPort, "lowest")
+	minNote, err := captureNote(inputPort)
 	if err != nil {
 		return nil, fmt.Errorf("failed to capture min note: %w", err)
 	}
 
-	fmt.Printf("Lowest note captured: %s (MIDI note %d)\n", noteToName(minNote), minNote)
-	fmt.Println("Now play the HIGHEST note you want to include in this output.")
+	fmt.Printf("Play the HIGHEST note: ")
 
-	maxNote, err := captureNote(inputPort, "highest")
+	maxNote, err := captureNote(inputPort)
 	if err != nil {
 		return nil, fmt.Errorf("failed to capture max note: %w", err)
 	}
 
-	fmt.Printf("Highest note captured: %s (MIDI note %d)\n", noteToName(maxNote), maxNote)
-
 	if minNote > maxNote {
 		minNote, maxNote = maxNote, minNote
-		fmt.Printf("Note: Swapped min/max. Range: %s to %s\n", noteToName(minNote), noteToName(maxNote))
+		fmt.Printf("Range: %s to %s\n", noteToName(minNote), noteToName(maxNote))
 	}
 
 	reader := bufio.NewReader(os.Stdin)
-	fmt.Printf("Confirm note range %s (%d) to %s (%d)? (Y/n): ",
-		noteToName(minNote), minNote, noteToName(maxNote), maxNote)
+	fmt.Printf("Confirm range %s to %s? (Y/n): ",
+		noteToName(minNote), noteToName(maxNote))
 	line, err := reader.ReadString('\n')
 	if err != nil {
 		return nil, fmt.Errorf("failed to read input: %w", err)
 	}
 
 	if strings.ToLower(strings.TrimSpace(line)) == "n" {
-		fmt.Println("Note range configuration cancelled.")
 		return &NoteRangeFilter{Enabled: false}, nil
 	}
 
@@ -362,16 +402,7 @@ func configureNoteRange(inputPort drivers.In) (*NoteRangeFilter, error) {
 }
 
 // captureNote listens for a single Note On event and returns the note number
-func captureNote(inputPort drivers.In, noteType string) (uint8, error) {
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Printf("Press Enter when ready to capture %s note...", noteType)
-	_, err := reader.ReadString('\n')
-	if err != nil {
-		return 0, fmt.Errorf("failed to read input: %w", err)
-	}
-
-	fmt.Printf("Listening for %s note... (play a note within 30 seconds)\n", noteType)
-
+func captureNote(inputPort drivers.In) (uint8, error) {
 	noteChan := make(chan uint8, 1)
 	errorChan := make(chan error, 1)
 
@@ -379,7 +410,7 @@ func captureNote(inputPort drivers.In, noteType string) (uint8, error) {
 	stop, err := midi.ListenTo(inputPort, func(msg midi.Message, timestampms int32) {
 		var channel, key, velocity uint8
 		if msg.GetNoteOn(&channel, &key, &velocity) && velocity > 0 {
-			fmt.Printf("Captured note: %s (MIDI note %d) on channel %d\n", noteToName(key), key, channel+1)
+			fmt.Printf("%s\n", noteToName(key))
 			select {
 			case noteChan <- key:
 			default:
@@ -457,7 +488,6 @@ func runMIDIRouter(drv *rtmididrv.Driver, config *Config, quiet bool) error {
 	}
 
 	// Create virtual outputs
-	fmt.Printf("\nCreating %d virtual MIDI outputs:\n", len(config.Outputs))
 	outputs := make([]drivers.Out, len(config.Outputs))
 	senders := make([]func(midi.Message) error, len(config.Outputs))
 
@@ -476,26 +506,20 @@ func runMIDIRouter(drv *rtmididrv.Driver, config *Config, quiet bool) error {
 		outputs[i] = virtualOut
 		senders[i] = sender
 
-		fmt.Printf("- %s", outputConfig.Name)
+		filterInfo := ""
 		if outputConfig.ChannelFilter.Enabled {
-			fmt.Printf(" (Channel %d)", outputConfig.ChannelFilter.Channel)
+			filterInfo += fmt.Sprintf(" (Ch%d)", outputConfig.ChannelFilter.Channel)
 		}
 		if outputConfig.NoteRangeFilter.Enabled {
-			fmt.Printf(" (Notes %s-%s)",
+			filterInfo += fmt.Sprintf(" (%s-%s)",
 				noteToName(outputConfig.NoteRangeFilter.MinNote),
 				noteToName(outputConfig.NoteRangeFilter.MaxNote))
 		}
-		fmt.Println()
+		fmt.Printf("- %s%s\n", outputConfig.Name, filterInfo)
 	}
 
-	// Display configuration summary
-	fmt.Printf("\nConfiguration Summary:\n")
-	fmt.Printf("Input: %s\n", config.InputDevice)
-	fmt.Printf("Outputs: %d virtual ports\n", len(config.Outputs))
-
 	// Start routing
-	fmt.Printf("\nMIDI router is running. Press Ctrl+C to stop...\n")
-	fmt.Printf("Routing display format: [Output names] Message\n\n")
+	fmt.Println("\nRunning. Press Ctrl+C to stop...")
 
 	stop, err := midi.ListenTo(selectedInput, func(msg midi.Message, timestampms int32) {
 		routedTo := make([]string, 0, len(config.Outputs))
@@ -528,7 +552,7 @@ func runMIDIRouter(drv *rtmididrv.Driver, config *Config, quiet bool) error {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	<-sigChan
 
-	fmt.Println("\nShutting down...")
+	fmt.Println("Shutting down...")
 	stop()
 
 	return nil
