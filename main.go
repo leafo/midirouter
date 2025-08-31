@@ -363,14 +363,14 @@ func noteToName(note uint8) string {
 
 // configureNoteRange configures note range by listening to actual MIDI input
 func configureNoteRange(inputPort drivers.In) (*NoteRangeFilter, error) {
-	fmt.Printf("Play the LOWEST note: ")
+	fmt.Printf("  Play the LOWEST note: ")
 
 	minNote, err := captureNote(inputPort)
 	if err != nil {
 		return nil, fmt.Errorf("failed to capture min note: %w", err)
 	}
 
-	fmt.Printf("Play the HIGHEST note: ")
+	fmt.Printf("  Play the HIGHEST note: ")
 
 	maxNote, err := captureNote(inputPort)
 	if err != nil {
@@ -379,7 +379,6 @@ func configureNoteRange(inputPort drivers.In) (*NoteRangeFilter, error) {
 
 	if minNote > maxNote {
 		minNote, maxNote = maxNote, minNote
-		fmt.Printf("Range: %s to %s\n", noteToName(minNote), noteToName(maxNote))
 	}
 
 	reader := bufio.NewReader(os.Stdin)
@@ -505,22 +504,16 @@ func runMIDIRouter(drv *rtmididrv.Driver, config *Config, quiet bool) error {
 
 		outputs[i] = virtualOut
 		senders[i] = sender
-
-		filterInfo := ""
-		if outputConfig.ChannelFilter.Enabled {
-			filterInfo += fmt.Sprintf(" (Ch%d)", outputConfig.ChannelFilter.Channel)
-		}
-		if outputConfig.NoteRangeFilter.Enabled {
-			filterInfo += fmt.Sprintf(" (%s-%s)",
-				noteToName(outputConfig.NoteRangeFilter.MinNote),
-				noteToName(outputConfig.NoteRangeFilter.MaxNote))
-		}
-		fmt.Printf("- %s%s\n", outputConfig.Name, filterInfo)
 	}
 
-	// Start routing
-	fmt.Println("\nRunning. Press Ctrl+C to stop...")
+	configJSON, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal configuration: %w", err)
+	}
+	fmt.Printf("Running with configuration:\n%s\n", configJSON)
+	fmt.Println("Press Ctrl+C to stop...")
 
+	// Start routing
 	stop, err := midi.ListenTo(selectedInput, func(msg midi.Message, timestampms int32) {
 		routedTo := make([]string, 0, len(config.Outputs))
 
