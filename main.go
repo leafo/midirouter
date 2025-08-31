@@ -21,22 +21,20 @@ import (
 
 // ChannelFilter represents a MIDI channel filter
 type ChannelFilter struct {
-	Enabled bool  `json:"enabled"`
 	Channel uint8 `json:"channel"` // 1-16
 }
 
 // NoteRangeFilter represents a note range filter
 type NoteRangeFilter struct {
-	Enabled bool  `json:"enabled"`
 	MinNote uint8 `json:"min_note"` // MIDI note number 0-127
 	MaxNote uint8 `json:"max_note"` // MIDI note number 0-127
 }
 
 // OutputConfig represents the configuration for a single output
 type OutputConfig struct {
-	Name            string          `json:"name"`
-	ChannelFilter   ChannelFilter   `json:"channel_filter"`
-	NoteRangeFilter NoteRangeFilter `json:"note_range_filter"`
+	Name            string           `json:"name"`
+	ChannelFilter   *ChannelFilter   `json:"channel_filter"`
+	NoteRangeFilter *NoteRangeFilter `json:"note_range_filter"`
 }
 
 // Config represents the complete router configuration
@@ -148,10 +146,10 @@ func validateConfigStructure(config *Config) error {
 		if output.Name == "" {
 			return fmt.Errorf("output %d has no name", i+1)
 		}
-		if output.ChannelFilter.Enabled && (output.ChannelFilter.Channel < 1 || output.ChannelFilter.Channel > 16) {
+		if output.ChannelFilter != nil && (output.ChannelFilter.Channel < 1 || output.ChannelFilter.Channel > 16) {
 			return fmt.Errorf("output %d has invalid channel: %d (must be 1-16)", i+1, output.ChannelFilter.Channel)
 		}
-		if output.NoteRangeFilter.Enabled && output.NoteRangeFilter.MinNote > output.NoteRangeFilter.MaxNote {
+		if output.NoteRangeFilter != nil && output.NoteRangeFilter.MinNote > output.NoteRangeFilter.MaxNote {
 			return fmt.Errorf("output %d has invalid note range: %d-%d", i+1, output.NoteRangeFilter.MinNote, output.NoteRangeFilter.MaxNote)
 		}
 	}
@@ -343,8 +341,9 @@ func interactiveConfig(drv *rtmididrv.Driver) (*Config, error) {
 				return nil, fmt.Errorf("invalid channel number (must be 1-16)")
 			}
 
-			config.Outputs[i].ChannelFilter.Enabled = true
-			config.Outputs[i].ChannelFilter.Channel = uint8(channel)
+			config.Outputs[i].ChannelFilter = &ChannelFilter{
+				Channel: uint8(channel),
+			}
 		}
 
 		// Note range filter
@@ -359,7 +358,7 @@ func interactiveConfig(drv *rtmididrv.Driver) (*Config, error) {
 			if err != nil {
 				return nil, fmt.Errorf("failed to configure note range: %w", err)
 			}
-			config.Outputs[i].NoteRangeFilter = *noteRange
+			config.Outputs[i].NoteRangeFilter = noteRange
 		}
 	}
 
@@ -403,11 +402,10 @@ func configureNoteRange(inputPort drivers.In) (*NoteRangeFilter, error) {
 	}
 
 	if strings.ToLower(strings.TrimSpace(line)) == "n" {
-		return &NoteRangeFilter{Enabled: false}, nil
+		return nil, nil
 	}
 
 	return &NoteRangeFilter{
-		Enabled: true,
 		MinNote: minNote,
 		MaxNote: maxNote,
 	}, nil
@@ -450,7 +448,7 @@ func captureNote(inputPort drivers.In) (uint8, error) {
 // shouldRouteMessage checks if a message should be routed to a specific output
 func shouldRouteMessage(msg midi.Message, outputConfig *OutputConfig) bool {
 	// Channel filter
-	if outputConfig.ChannelFilter.Enabled {
+	if outputConfig.ChannelFilter != nil {
 		var channel, key, velocity uint8
 		if msg.GetNoteOn(&channel, &key, &velocity) || msg.GetNoteOff(&channel, &key, &velocity) {
 			if channel+1 != outputConfig.ChannelFilter.Channel {
@@ -468,7 +466,7 @@ func shouldRouteMessage(msg midi.Message, outputConfig *OutputConfig) bool {
 	}
 
 	// Note range filter
-	if outputConfig.NoteRangeFilter.Enabled {
+	if outputConfig.NoteRangeFilter != nil {
 		var channel, key, velocity uint8
 		if msg.GetNoteOn(&channel, &key, &velocity) || msg.GetNoteOff(&channel, &key, &velocity) {
 			if key < outputConfig.NoteRangeFilter.MinNote || key > outputConfig.NoteRangeFilter.MaxNote {
