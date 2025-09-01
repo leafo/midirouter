@@ -56,9 +56,11 @@ func (nrf *NoteRangeFilter) ShouldPass(msg midi.Message) bool {
 
 // OutputConfig represents the configuration for a single output
 type OutputConfig struct {
-	Name            string           `json:"name"`
-	ChannelFilter   *ChannelFilter   `json:"channel_filter"`
-	NoteRangeFilter *NoteRangeFilter `json:"note_range_filter"`
+	Name               string           `json:"name"`
+	ChannelFilter      *ChannelFilter   `json:"channel_filter"`
+	NoteRangeFilter    *NoteRangeFilter `json:"note_range_filter"`
+	OverrideChannel    *uint8           `json:"override_channel"`    // 1-16, optional
+	TransposeSemitones *int8            `json:"transpose_semitones"` // -127 to +127, optional
 }
 
 // Config represents the complete router configuration
@@ -66,6 +68,14 @@ type Config struct {
 	InputDevice string         `json:"input_device"`
 	OutputBase  string         `json:"output_base"`
 	Outputs     []OutputConfig `json:"outputs"`
+}
+
+// MessageTransformation tracks transformations applied to a MIDI message
+type MessageTransformation struct {
+	OriginalChannel    *uint8 // nil if no channel info or no change
+	TransformedChannel *uint8
+	OriginalNote       *uint8 // nil if not a note message or no change
+	TransformedNote    *uint8
 }
 
 func main() {
@@ -175,6 +185,12 @@ func validateConfigStructure(config *Config) error {
 		}
 		if output.NoteRangeFilter != nil && output.NoteRangeFilter.MinNote > output.NoteRangeFilter.MaxNote {
 			return fmt.Errorf("output %d has invalid note range: %d-%d", i+1, output.NoteRangeFilter.MinNote, output.NoteRangeFilter.MaxNote)
+		}
+		if output.OverrideChannel != nil && (*output.OverrideChannel < 1 || *output.OverrideChannel > 16) {
+			return fmt.Errorf("output %d has invalid override channel: %d (must be 1-16)", i+1, *output.OverrideChannel)
+		}
+		if output.TransposeSemitones != nil && (*output.TransposeSemitones < -127 || *output.TransposeSemitones > 127) {
+			return fmt.Errorf("output %d has invalid transpose semitones: %d (must be -127 to 127)", i+1, *output.TransposeSemitones)
 		}
 	}
 
@@ -384,6 +400,52 @@ func interactiveConfig(drv *rtmididrv.Driver) (*Config, error) {
 			}
 			config.Outputs[i].NoteRangeFilter = noteRange
 		}
+
+		// Override channel
+		fmt.Print("Enable channel override? (y/N): ")
+		line, err = reader.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("failed to read input: %w", err)
+		}
+
+		if strings.ToLower(strings.TrimSpace(line)) == "y" {
+			fmt.Print("Override channel (1-16): ")
+			line, err = reader.ReadString('\n')
+			if err != nil {
+				return nil, fmt.Errorf("failed to read input: %w", err)
+			}
+
+			channel, err := strconv.Atoi(strings.TrimSpace(line))
+			if err != nil || channel < 1 || channel > 16 {
+				return nil, fmt.Errorf("invalid override channel number (must be 1-16)")
+			}
+
+			overrideChannel := uint8(channel)
+			config.Outputs[i].OverrideChannel = &overrideChannel
+		}
+
+		// Note transposition
+		fmt.Print("Enable note transposition? (y/N): ")
+		line, err = reader.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("failed to read input: %w", err)
+		}
+
+		if strings.ToLower(strings.TrimSpace(line)) == "y" {
+			fmt.Print("Transpose semitones (-127 to +127): ")
+			line, err = reader.ReadString('\n')
+			if err != nil {
+				return nil, fmt.Errorf("failed to read input: %w", err)
+			}
+
+			transpose, err := strconv.Atoi(strings.TrimSpace(line))
+			if err != nil || transpose < -127 || transpose > 127 {
+				return nil, fmt.Errorf("invalid transpose semitones (must be -127 to 127)")
+			}
+
+			transposeSemitones := int8(transpose)
+			config.Outputs[i].TransposeSemitones = &transposeSemitones
+		}
 	}
 
 	return config, nil
@@ -469,6 +531,188 @@ func captureNote(inputPort drivers.In) (uint8, error) {
 	}
 }
 
+// applyChannelOverride modifies a MIDI message to use the override channel if configured
+// Returns the modified message and transformation info
+func applyChannelOverride(msg midi.Message, overrideChannel *uint8, transform *MessageTransformation) midi.Message {
+	if overrideChannel == nil {
+		return msg
+	}
+
+	// Create a copy of the message to avoid modifying the original
+	newMsg := make(midi.Message, len(msg))
+	copy(newMsg, msg)
+
+	// Apply channel override to messages that have channel information
+	if len(newMsg) >= 1 {
+		statusByte := newMsg[0]
+		// Check if it's a channel message (0x80-0xEF)
+		if statusByte >= 0x80 && statusByte <= 0xEF {
+			originalChannel := (statusByte & 0x0F) + 1 // Convert to 1-based
+			// Clear the channel bits and set the new channel (0-based)
+			newMsg[0] = (statusByte & 0xF0) | ((*overrideChannel - 1) & 0x0F)
+
+			// Record the transformation
+			transform.OriginalChannel = &originalChannel
+			transform.TransformedChannel = overrideChannel
+		}
+	}
+
+	return newMsg
+}
+
+// applyNoteTransposition modifies note numbers in MIDI Note On/Off messages if configured
+// Returns the modified message and updates transformation info
+func applyNoteTransposition(msg midi.Message, transposeSemitones *int8, transform *MessageTransformation) midi.Message {
+	if transposeSemitones == nil || *transposeSemitones == 0 {
+		return msg
+	}
+
+	var channel, key, velocity uint8
+
+	// Check if it's a Note On message
+	if msg.GetNoteOn(&channel, &key, &velocity) {
+		newNote := int(key) + int(*transposeSemitones)
+		// Clamp to valid MIDI note range (0-127)
+		if newNote < 0 || newNote > 127 {
+			// Return original message if transposition would go out of range
+			return msg
+		}
+
+		// Record the transformation
+		transform.OriginalNote = &key
+		transposedNote := uint8(newNote)
+		transform.TransformedNote = &transposedNote
+
+		// Create new Note On message with transposed note
+		newMsg := make(midi.Message, len(msg))
+		copy(newMsg, msg)
+		newMsg[1] = uint8(newNote)
+		return newMsg
+	}
+
+	// Check if it's a Note Off message
+	if msg.GetNoteOff(&channel, &key, &velocity) {
+		newNote := int(key) + int(*transposeSemitones)
+		// Clamp to valid MIDI note range (0-127)
+		if newNote < 0 || newNote > 127 {
+			// Return original message if transposition would go out of range
+			return msg
+		}
+
+		// Record the transformation
+		transform.OriginalNote = &key
+		transposedNote := uint8(newNote)
+		transform.TransformedNote = &transposedNote
+
+		// Create new Note Off message with transposed note
+		newMsg := make(midi.Message, len(msg))
+		copy(newMsg, msg)
+		newMsg[1] = uint8(newNote)
+		return newMsg
+	}
+
+	// For non-note messages, return unchanged
+	return msg
+}
+
+// formatMessageWithTransformations creates a formatted string showing MIDI message with transformations
+func formatMessageWithTransformations(originalMsg midi.Message, transform *MessageTransformation) string {
+	// Get the message type name from the MIDI library
+	messageType := originalMsg.Type().String()
+
+	// Handle messages with channel information (channel messages)
+	if hasChannelInfo(originalMsg) {
+		originalChannel := extractChannelFromMessage(originalMsg)
+		channelStr := formatChannelTransformation(originalChannel, transform)
+
+		// Handle note messages (Note On/Off) with special note transformation display
+		if isNoteMessage(originalMsg) {
+			var channel, key, velocity uint8
+			if originalMsg.GetNoteOn(&channel, &key, &velocity) || originalMsg.GetNoteOff(&channel, &key, &velocity) {
+				noteStr := formatNoteTransformation(key, transform)
+				return fmt.Sprintf("%s %s, %s, velocity: %d", messageType, channelStr, noteStr, velocity)
+			}
+		}
+
+		// Handle other channel messages (ControlChange, ProgramChange, Pitchbend, etc.)
+		if len(originalMsg) > 1 {
+			return fmt.Sprintf("%s %s, data: %v", messageType, channelStr, originalMsg[1:])
+		}
+		return fmt.Sprintf("%s %s", messageType, channelStr)
+	}
+
+	// Handle system messages (no channel information)
+	if len(originalMsg) > 1 {
+		return fmt.Sprintf("%s data: %v", messageType, originalMsg[1:])
+	}
+	return fmt.Sprintf("%s", messageType)
+}
+
+// formatChannelTransformation formats channel info with before->after if changed
+func formatChannelTransformation(originalChannel uint8, transform *MessageTransformation) string {
+	if transform.OriginalChannel != nil && transform.TransformedChannel != nil {
+		return fmt.Sprintf("channel: %d->%d", *transform.OriginalChannel, *transform.TransformedChannel)
+	}
+	return fmt.Sprintf("channel: %d", originalChannel)
+}
+
+// formatNoteTransformation formats note info with before->after if changed
+func formatNoteTransformation(originalNote uint8, transform *MessageTransformation) string {
+	if transform.OriginalNote != nil && transform.TransformedNote != nil {
+		return fmt.Sprintf("note: %d->%d", *transform.OriginalNote, *transform.TransformedNote)
+	}
+	return fmt.Sprintf("note: %d", originalNote)
+}
+
+// isNoteMessage checks if a message is a Note On or Note Off message
+func isNoteMessage(msg midi.Message) bool {
+	var channel, key, velocity uint8
+	return msg.GetNoteOn(&channel, &key, &velocity) || msg.GetNoteOff(&channel, &key, &velocity)
+}
+
+// hasChannelInfo checks if a message has channel information (channel messages)
+func hasChannelInfo(msg midi.Message) bool {
+	if len(msg) >= 1 {
+		statusByte := msg[0]
+		// Check if it's a channel message (0x80-0xEF)
+		return statusByte >= 0x80 && statusByte <= 0xEF
+	}
+	return false
+}
+
+// extractChannelFromMessage extracts the channel number from a MIDI message (1-based)
+func extractChannelFromMessage(msg midi.Message) uint8 {
+	if len(msg) >= 1 {
+		statusByte := msg[0]
+		if statusByte >= 0x80 && statusByte <= 0xEF {
+			return (statusByte & 0x0F) + 1 // Convert to 1-based
+		}
+	}
+	return 0
+}
+
+// logSuccessfulRoute logs a successful message route to a specific output
+func logSuccessfulRoute(outputName string, originalMsg midi.Message, transform *MessageTransformation, quiet bool) {
+	if quiet {
+		return
+	}
+
+	formattedMsg := formatMessageWithTransformations(originalMsg, transform)
+	fmt.Printf("[%s] %s\n", outputName, formattedMsg)
+}
+
+// logDroppedMessage logs when a message was not routed to any output
+func logDroppedMessage(originalMsg midi.Message, quiet bool) {
+	if quiet {
+		return
+	}
+
+	// Use empty transformation for dropped messages (no transformations applied)
+	emptyTransform := &MessageTransformation{}
+	formattedMsg := formatMessageWithTransformations(originalMsg, emptyTransform)
+	fmt.Printf("\033[2m[DROPPED] %s\033[0m\n", formattedMsg)
+}
+
 // shouldRouteMessage checks if a message should be routed to a specific output
 func shouldRouteMessage(msg midi.Message, outputConfig *OutputConfig) bool {
 	// Channel filter
@@ -537,26 +781,34 @@ func runMIDIRouter(drv *rtmididrv.Driver, config *Config, quiet bool) error {
 
 	// Start routing
 	stop, err := midi.ListenTo(selectedInput, func(msg midi.Message, timestampms int32) {
-		routedTo := make([]string, 0, len(config.Outputs))
+		anyRouted := false
 
 		for i, outputConfig := range config.Outputs {
 			if shouldRouteMessage(msg, &outputConfig) {
 				fullName := fmt.Sprintf("%s %s", config.OutputBase, outputConfig.Name)
-				err := senders[i](msg)
+
+				// Initialize transformation tracking for this output
+				outputTransform := &MessageTransformation{}
+
+				// Apply channel override if configured
+				msgToSend := applyChannelOverride(msg, outputConfig.OverrideChannel, outputTransform)
+				// Apply note transposition if configured
+				msgToSend = applyNoteTransposition(msgToSend, outputConfig.TransposeSemitones, outputTransform)
+
+				err := senders[i](msgToSend)
 				if err != nil {
 					log.Printf("Error sending to %s: %v", fullName, err)
 				} else {
-					routedTo = append(routedTo, fullName)
+					// Log successful route immediately with per-output transformations
+					logSuccessfulRoute(fullName, msg, outputTransform, quiet)
+					anyRouted = true
 				}
 			}
 		}
 
-		if !quiet {
-			if len(routedTo) > 0 {
-				fmt.Printf("[%s] %v\n", strings.Join(routedTo, ", "), msg)
-			} else {
-				fmt.Printf("\033[2m[DROPPED] %v\033[0m\n", msg)
-			}
+		// Log dropped message if no outputs were successful
+		if !anyRouted {
+			logDroppedMessage(msg, quiet)
 		}
 	})
 
